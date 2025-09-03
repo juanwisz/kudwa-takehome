@@ -1,32 +1,55 @@
-import json
+# scripts/load_data.py
 import os
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
 from app.db import SessionLocal, init_db
 from app.models import Transaction
 
 DATA_DIR = "data"
 
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
-def load_quickbooks(path):
+
+# --- Helpers ---
+def safe_float(val: Any) -> Optional[float]:
+    """Try to parse a float, return None if invalid."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+# --- QuickBooks Loader ---
+def load_quickbooks(path: str, db):
+    logger.info(f"Loading QuickBooks data from {path}")
+
     with open(path) as f:
         raw = json.load(f)
 
-    db = SessionLocal()
     cols = raw["data"]["Columns"]["Column"]
+    # Map col titles ("Jan 2020") to StartDate ("2020-01-01")
     col_map = {}
     for col in cols:
         if col.get("ColType") == "Money":
             meta = {m["Name"]: m["Value"] for m in col.get("MetaData", [])}
             col_map[col["ColTitle"]] = meta.get("StartDate")
 
-    def process_rows(rows):
+    def process_rows(rows: List[Dict]):
         for row in rows:
-            # Some rows have nested children
-            if "Rows" in row:
+            if "Rows" in row:  # Nested children
                 process_rows(row["Rows"]["Row"])
                 continue
 
             if "ColData" not in row:
-                continue  # skip headers/totals
+                continue  # Skip headers/totals
 
             col_data = row["ColData"]
             if not col_data or "value" not in col_data[0]:
@@ -34,64 +57,89 @@ def load_quickbooks(path):
 
             account = col_data[0]["value"]
             for i, coldata in enumerate(col_data[1:], start=1):
-                if "value" not in coldata:
+                amount = safe_float(coldata.get("value"))
+                if amount is None:
                     continue
-                try:
-                    amount = float(coldata["value"])
-                except ValueError:
-                    continue
+
                 col_title = cols[i]["ColTitle"]
                 date = col_map.get(col_title)
-                t = Transaction(
+                t_type = "revenue" if amount >= 0 else "expense"
+
+                tx = Transaction(
                     date=date,
                     source="quickbooks",
-                    type="revenue" if amount >= 0 else "expense",
+                    type=t_type,
                     category=account,
                     amount=abs(amount),
                 )
-                db.add(t)
+                db.add(tx)
 
     rows = raw["data"]["Rows"]["Row"]
     process_rows(rows)
     db.commit()
-    print(f"✅ Loaded QuickBooks data from {path}")
+    logger.info("✅ QuickBooks data loaded successfully")
 
 
-def parse_line_items(line_items, source, type_, date, db):
-    for li in line_items:
-        t = Transaction(
-            date=date,
-            source=source,
-            type=type_,
-            category=li["name"],
-            amount=float(li.get("value", 0)),
-        )
-        db.add(t)
-        if "line_items" in li and li["line_items"]:
-            parse_line_items(li["line_items"], source, type_, date, db)
+# --- Rootfi Loader ---
+def load_rootfi(path: str, db):
+    logger.info(f"Loading Rootfi data from {path}")
 
-
-def load_rootfi(path):
     with open(path) as f:
         raw = json.load(f)
 
-    db = SessionLocal()
-    for report in raw["data"]:
-        date = report.get("period_end")
-        # Revenue
-        for rev in report.get("revenue", []):
-            parse_line_items([rev], "rootfi", "revenue", date, db)
-        # COGS / expenses
-        for cogs in report.get("cost_of_goods_sold", []):
-            parse_line_items([cogs], "rootfi", "expense", date, db)
-        for exp in report.get("operating_expenses", []):
-            parse_line_items([exp], "rootfi", "expense", date, db)
+    for entry in raw["data"]:
+        date = entry.get("period_end")
+
+        def process_items(items: List[Dict], t_type: str):
+            for item in items:
+                amount = safe_float(item.get("value"))
+                if amount is None or amount == 0:
+                    continue
+                tx = Transaction(
+                    date=date,
+                    source="rootfi",
+                    type=t_type,
+                    category=item.get("name", "unknown"),
+                    amount=abs(amount),
+                )
+                db.add(tx)
+
+                # Recurse into nested line_items
+                if "line_items" in item and isinstance(item["line_items"], list):
+                    process_items(item["line_items"], t_type)
+
+        process_items(entry.get("revenue", []), "revenue")
+        process_items(entry.get("cost_of_goods_sold", []), "expense")
+        process_items(entry.get("operating_expenses", []), "expense")
+        process_items(entry.get("other_expenses", []), "expense")
+        process_items(entry.get("net_income", []), "profit")
+
     db.commit()
-    print(f"✅ Loaded Rootfi data from {path}")
+    logger.info("✅ Rootfi data loaded successfully")
+
+
+# --- Entrypoint ---
+def main():
+    logger.info("Initializing database...")
+    init_db()
+    db = SessionLocal()
+
+    quickbooks_path = os.path.join(DATA_DIR, "data_set_1.json")
+    rootfi_path = os.path.join(DATA_DIR, "data_set_2.json")
+
+    if os.path.exists(quickbooks_path):
+        load_quickbooks(quickbooks_path, db)
+    else:
+        logger.warning("QuickBooks dataset not found")
+
+    if os.path.exists(rootfi_path):
+        load_rootfi(rootfi_path, db)
+    else:
+        logger.warning("Rootfi dataset not found")
+
+    db.close()
+    logger.info("🎉 Data loading complete!")
 
 
 if __name__ == "__main__":
-    init_db()
-    load_quickbooks(os.path.join(DATA_DIR, "data_set_1.json"))
-    load_rootfi(os.path.join(DATA_DIR, "data_set_2.json"))
-    print("🎉 All data loaded successfully")
+    main()

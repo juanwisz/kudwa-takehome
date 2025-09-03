@@ -2,3 +2,9 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 sqlalchemy==2.0.43
 openai==1.104.2
+langchain
+langchain-core
+langchain-openai
+statsmodels
+pandas
+matplotlib

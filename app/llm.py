@@ -1,63 +1,93 @@
 import os
-from openai import OpenAI
-from sqlalchemy.orm import Session
-from sqlalchemy import inspect, text
-from app.db import engine
-from app.models import Transaction
+import json
 from dotenv import load_dotenv
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session
 
-# Load .env automatically
+from langchain_openai import ChatOpenAI
+from langchain.agents import initialize_agent, AgentType
+
+from app.db import engine, SessionLocal
+from app.models import Transaction, QueryLog
+from app.prompts import build_agent_prompt
+from app.tools.sql_tool import sql_query
+from app.tools.forecast_tool import forecast_arima
+from app.logger import logger
+
 load_dotenv()
 
-def get_schema():
+
+def get_schema() -> str:
+    """Inspect the DB and return schema definition for transactions table."""
     insp = inspect(engine)
-    columns = insp.get_columns(Transaction.__tablename__)
-    col_defs = [f"{col['name']} {col['type']}" for col in columns]
+    cols = insp.get_columns(Transaction.__tablename__)
+    col_defs = [f"{c['name']} {c['type']}" for c in cols]
     return f"{Transaction.__tablename__}({', '.join(col_defs)})"
 
-def query_llm(question: str, db: Session):
+
+def log_query(question: str, sql: str, tool: str, result: dict, report: str):
+    """Persist query execution into QueryLog table."""
+    db = SessionLocal()
+    try:
+        entry = QueryLog(
+            question=question,
+            sql=sql,
+            tool=tool,
+            result=json.dumps(result) if result else None,
+            report=report,
+        )
+        db.add(entry)
+        db.commit()
+    except Exception as e:
+        logger.warning("Failed to log query: %s", str(e))
+        db.rollback()
+    finally:
+        db.close()
+
+
+def query_agent(question: str, db: Session):
+    """Main entrypoint: run user question through LLM agent and persist results."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return {"error": "OPENAI_API_KEY is missing. Did you create a .env file?"}
+        msg = "OPENAI_API_KEY is missing"
+        logger.error(msg)
+        return {"error": msg}
 
-    client = OpenAI(api_key=api_key)
-
+    # Build context-aware system prompt
     schema = get_schema()
+    system_prompt = build_agent_prompt(schema)
 
-    # Step 1: NL → SQL
-    prompt = f"""
-    You are a financial analyst.
-    Translate the following natural language question into a valid SQL query.
-    Database schema: {schema}.
-    Only return the SQL query, nothing else.
+    llm = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        openai_api_key=api_key,
+    )
 
-    Question: {question}
-    """
+    # Register tools available to the agent
+    tools = [sql_query, forecast_arima]
 
-    sql = client.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    ).choices[0].message.content.strip()
+    agent = initialize_agent(
+        tools=tools,
+        llm=llm,
+        agent=AgentType.OPENAI_FUNCTIONS,
+        verbose=True,
+        agent_kwargs={"system_message": system_prompt},
+    )
 
     try:
-        rows = db.execute(text(sql)).fetchall()
-        result = [dict(r._mapping) for r in rows]  # 👈 JSON serializable
+        report = agent.run(question)
+        logger.info("QUESTION=%s | REPORT=%s", question, report[:200])
 
-        summary_prompt = f"""
-        Question: {question}
-        SQL: {sql}
-        Result: {result}
-        Provide a concise financial insight in plain English.
-        """
+        # Collect minimal metadata for logging
+        sql = getattr(sql_query, "last_sql", None) or ""
+        result = getattr(sql_query, "last_result", {}) or {}
+        tool_used = "forecast_arima" if "forecast" in question.lower() else "sql_query"
 
-        answer = client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": summary_prompt}],
-            temperature=0.3
-        ).choices[0].message.content.strip()
+        log_query(question, sql, tool_used, result, report)
 
-        return {"sql": sql, "result": result, "answer": answer}
+        return {"question": question, "report": report}
     except Exception as e:
-        return {"error": str(e), "sql": sql}
-
+        err_msg = f"Agent failed: {str(e)}"
+        logger.error(err_msg)
+        log_query(question, "", "agent", {}, f"ERROR: {str(e)}")
+        return {"error": str(e)}
